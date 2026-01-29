@@ -1,10 +1,26 @@
 import logging
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+import os
+import sys
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
-from typing import Optional
+from typing import Annotated
+from dotenv import load_dotenv
+
+# Завантажуємо змінні з .env
+load_dotenv()
+
+# Отримуємо токен. Якщо його немає - це критична помилка конфігурації.
+API_TOKEN = os.getenv("KDV_API_TOKEN")
+if not API_TOKEN:
+    print("❌ CRITICAL ERROR: KDV_API_TOKEN is not set in .env!")
+    # Можна зробити sys.exit(1), але краще залишити, щоб бачити логи
 
 # Налаштування логування
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger("KDV-API")
 
 app = FastAPI(title="KDV Integrator API", version="3.0.0")
@@ -15,41 +31,51 @@ class IntegrationResponse(BaseModel):
     message: str
     job_id: str
 
-# --- ФОНОВІ ЗАДАЧІ (ЗАГЛУШКА) ---
+# --- ФУНКЦІЯ ПЕРЕВІРКИ БЕЗПЕКИ ---
+async def verify_token(x_kdv_token: Annotated[str, Header(alias="X-KDV-TOKEN")]):
+    """
+    Перевіряє токен.
+    Annotated[str, Header(...)] робить заголовок ОБОВ'ЯЗКОВИМ.
+    Якщо його немає - FastAPI автоматично поверне 422.
+    """
+    if not API_TOKEN:
+        logger.error("API Token is not configured on server!")
+        raise HTTPException(status_code=500, detail="Server misconfiguration")
+        
+    if x_kdv_token != API_TOKEN:
+        logger.warning(f"⛔ Unauthorized access attempt. Token: {x_kdv_token}")
+        raise HTTPException(status_code=401, detail="Invalid API Token")
+    
+    return x_kdv_token
+
+# --- ФОНОВІ ЗАДАЧІ ---
 def fake_integration_task(bib_id: int):
-    """
-    Тут пізніше буде код Daywalker.
-    Зараз ми просто імітуємо бурхливу діяльність.
-    """
     logger.info(f"🟢 [START] Processing Biblio {bib_id}...")
     import time
-    time.sleep(5) # Імітуємо роботу (завантаження файлів)
+    time.sleep(5) 
     logger.info(f"🔴 [DONE] Biblio {bib_id} processed.")
 
 # --- ENDPOINTS ---
 
 @app.get("/")
 def read_root():
-    """Перевірка, чи живий сервіс."""
-    return {"system": "KDV Integrator", "status": "online", "version": "3.0"}
+    """Публічний Healthcheck."""
+    return {"system": "KDV Integrator", "status": "online", "version": "3.0", "security": "enabled"}
 
-@app.post("/v1/integrate/{biblionumber}", status_code=202)
+@app.post("/v1/integrate/{biblionumber}", status_code=202, response_model=IntegrationResponse)
 async def integrate_biblio(
     biblionumber: int, 
     background_tasks: BackgroundTasks,
-    x_kdv_token: Optional[str] = Header(None) # Поки що просто приймаємо, не валідуємо строго
+    # Тут ми явно викликаємо залежність і зберігаємо результат (хоча він нам не треба)
+    token: str = Depends(verify_token)
 ):
     """
-    Ендпоінт, який викликатиме кнопка в Koha.
+    Захищений ендпоінт.
     """
-    logger.info(f"📨 Received request for Biblio: {biblionumber}")
+    logger.info(f"📨 Authorized request for Biblio: {biblionumber}")
     
-    # 1. (Пізніше) Тут буде перевірка токена
-    
-    # 2. Запускаємо задачу у фоні (щоб не змушувати браузер чекати)
     background_tasks.add_task(fake_integration_task, biblionumber)
     
-    # 3. Миттєво відповідаємо
     return {
         "status": "accepted", 
         "message": f"Integration started for biblio {biblionumber}",

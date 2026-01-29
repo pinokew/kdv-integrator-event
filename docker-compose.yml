@@ -4,35 +4,24 @@ services:
     container_name: kdv-api
     restart: unless-stopped
     
-    # ПОРТИ ПРИБРАНО! (Доступ тільки через Traefik)
-    
+    # ПІДКЛЮЧАЄМО ФАЙЛ З СЕКРЕТАМИ
+    env_file:
+      - .env
+      
     environment:
       - TZ=Europe/Kyiv
-      # Тут пізніше будуть змінні для Koha/DSpace
       
     networks:
       - dspacenet
 
     labels:
       - "traefik.enable=true"
-      
-      # 1. Маршрутизація (Router)
-      # Використовуємо одинарні лапки '...' всередині, це надійніше для YAML
-      - "traefik.http.routers.kdv-api.rule=Host('repo.fby.com.ua') && PathPrefix('/kdv/api')"
-      - "traefik.http.routers.kdv-api.entrypoints=websecure"
-      - "traefik.http.routers.kdv-api.tls=true"
-      
-      # 2. Сервіс (Service)
-      # Кажемо Traefik, що всередині контейнера ми слухаємо порт 8000
+      # Використовуємо `backticks`
+      - "traefik.http.routers.kdv-api.rule=Host(`repo.fby.com.ua`) && PathPrefix(`/kdv/api`)"
+      - "traefik.http.routers.kdv-api.priority=100"
+      - "traefik.http.routers.kdv-api.entrypoints=web"
       - "traefik.http.services.kdv-api.loadbalancer.server.port=8000"
-      
-      # Вказуємо Traefik, яку мережу використовувати для зв'язку (важливо для external мереж)
       - "traefik.docker.network=dspacenet"
-      
-      # 3. Middleware (Strip Prefix)
-      # Важливо! Це "відрізає" шматок /kdv/api перед тим, як передати запит у Python.
-      # Браузер запитує: /kdv/api/v1/integrate/...
-      # Python отримує:  /v1/integrate/...
       - "traefik.http.middlewares.kdv-api-strip.stripprefix.prefixes=/kdv/api"
       - "traefik.http.routers.kdv-api.middlewares=kdv-api-strip"
 
