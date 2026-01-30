@@ -1,32 +1,47 @@
 import os
-import sys
 import logging
-from dotenv import load_dotenv
+import sys
 
-# Завантажуємо .env (він у корені, на рівень вище src)
-load_dotenv(os.path.join(os.path.dirname(__file__), '../.env'))
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '../.env'))
+except ImportError:
+    pass
 
-def get_env(key: str, default: str = None) -> str:
+def get_env(key: str, required: bool = True, default: str = None) -> str:
     val = os.getenv(key, default)
-    if not val and default is None:
-        logging.error(f"❌ CRITICAL: Environment variable '{key}' is missing.")
+    if required and not val:
+        raise ValueError(f"CRITICAL ERROR: Environment variable '{key}' is missing.")
     return val
 
-# --- ШЛЯХИ ---
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True 
+    )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# --- КОНФІГУРАЦІЯ ---
+
+KDV_API_TOKEN = get_env("KDV_API_TOKEN")
+
+KOHA_API_URL = get_env("KOHA_API_URL").rstrip('/')
+KOHA_USER = get_env("KOHA_API_USER")
+KOHA_PASS = get_env("KOHA_API_PASS")
+
+DSPACE_API_URL = get_env("DSPACE_API_URL").rstrip('/')
+DSPACE_USER = get_env("DSPACE_API_USER")
+DSPACE_PASS = get_env("DSPACE_API_PASS")
+
+DSPACE_SUBMISSION_SECTION = get_env("DSPACE_SUBMISSION_SECTION", required=False, default="traditionalpageone")
+
 INTEGRATOR_MOUNT_PATH = get_env("INTEGRATOR_MOUNT_PATH", default="/mnt/drive")
 FOLDER_INBOX = get_env("FOLDER_INBOX", default="Inbox")
 FOLDER_PROCESSED = get_env("FOLDER_PROCESSED", default="Processed")
 FOLDER_ERROR = get_env("FOLDER_ERROR", default="Error")
 
-# --- СЕРВІСИ ---
-KOHA_API_URL = get_env("KOHA_API_URL", "").rstrip('/')
-KOHA_USER = get_env("KOHA_API_USER")
-KOHA_PASS = get_env("KOHA_API_PASS")
-
-DSPACE_API_URL = get_env("DSPACE_API_URL", "").rstrip('/')
-DSPACE_USER = get_env("DSPACE_API_USER")
-DSPACE_PASS = get_env("DSPACE_API_PASS")
-
-# --- НАЛАШТУВАННЯ ---
 TIMEOUT = 30
 UPLOAD_TIMEOUT = 300

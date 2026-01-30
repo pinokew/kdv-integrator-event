@@ -4,26 +4,45 @@ services:
     container_name: kdv-api
     restart: unless-stopped
     
-    # ПІДКЛЮЧАЄМО ФАЙЛ З СЕКРЕТАМИ
+    # 🟢 1. Запуск Production сервера (Gunicorn) на порту 5000
+    command: gunicorn -w 4 -b 0.0.0.0:5000 src.app:app
+    
     env_file:
       - .env
       
     environment:
       - TZ=Europe/Kyiv
+      # Якщо потрібно явно вказати шлях до диску, хоча він є в .env
+      - INTEGRATOR_MOUNT_PATH=/mnt/drive 
+
+    volumes:
+      - .:/app                 # Монтуємо код, щоб зміни підтягувались після перезапуску
+      # 🟢 2. Обов'язково монтуємо диск (rclone), інакше скрипт не знайде PDF файли
+      - /mnt/drive:/mnt/drive 
       
     networks:
       - dspacenet
 
     labels:
       - "traefik.enable=true"
-      # Використовуємо `backticks`
-      - "traefik.http.routers.kdv-api.rule=Host(`repo.fby.com.ua`) && PathPrefix(`/kdv/api`)"
+      # Хост залишив твій
+      - "traefik.http.routers.kdv-api.rule=Host(`${HOST}`) && PathPrefix(`/kdv/api`)"
       - "traefik.http.routers.kdv-api.priority=100"
       - "traefik.http.routers.kdv-api.entrypoints=web"
-      - "traefik.http.services.kdv-api.loadbalancer.server.port=8000"
+      
+      # 🟢 3. Порт змінено на 5000 (стандарт Flask/Gunicorn)
+      - "traefik.http.services.kdv-api.loadbalancer.server.port=5000"
+      
       - "traefik.docker.network=dspacenet"
-      - "traefik.http.middlewares.kdv-api-strip.stripprefix.prefixes=/kdv/api"
-      - "traefik.http.routers.kdv-api.middlewares=kdv-api-strip"
+      
+      # 🔴 4. StripPrefix ЗАКОМЕНТОВАНО (Видалено)
+      # Чому: Наш Flask app (src/app.py) вже очікує повний шлях '/kdv/api/...'
+      # Якщо Traefik відріже префікс, Flask поверне 404.
+      # - "traefik.http.middlewares.kdv-api-strip.stripprefix.prefixes=/kdv/api"
+      # - "traefik.http.routers.kdv-api.middlewares=kdv-api-strip"
+      
+      # Оскільки мідлвари немає, цей рядок теж коментуємо:
+      # - "traefik.http.routers.kdv-api.middlewares=kdv-api-strip"
 
 networks:
   dspacenet:
