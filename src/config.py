@@ -33,6 +33,9 @@ KOHA_USER = get_env("KOHA_API_USER")
 KOHA_PASS = get_env("KOHA_API_PASS")
 
 DSPACE_API_URL = get_env("DSPACE_API_URL").rstrip('/')
+# Додано URL для фронтенду (UI) DSpace, щоб формувати красиві посилання
+DSPACE_UI_URL = get_env("DSPACE_UI_URL").rstrip('/')
+
 DSPACE_USER = get_env("DSPACE_API_USER")
 DSPACE_PASS = get_env("DSPACE_API_PASS")
 

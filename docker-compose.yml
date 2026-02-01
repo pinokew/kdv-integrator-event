@@ -13,12 +13,12 @@ services:
     environment:
       - TZ=Europe/Kyiv
       # Якщо потрібно явно вказати шлях до диску, хоча він є в .env
-      - INTEGRATOR_MOUNT_PATH=/mnt/drive 
+      - INTEGRATOR_MOUNT_PATH=/mnt/drive
 
     volumes:
       - .:/app                 # Монтуємо код, щоб зміни підтягувались після перезапуску
       # 🟢 2. Обов'язково монтуємо диск (rclone), інакше скрипт не знайде PDF файли
-      - /mnt/drive:/mnt/drive 
+      - ${INTEGRATOR_MOUNT_PATH}:/mnt/drive
       
     networks:
       - dspacenet
