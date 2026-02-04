@@ -23,17 +23,12 @@ class KohaClient:
         url = f"{self.base_url}/api/v1/biblios/{biblio_id}"
         headers = {"Accept": "application/marcxml+xml"}
         try:
-            logger.info(f"Fetching Biblio #{biblio_id} from {url}")
+            # logger.info(f"Fetching Biblio #{biblio_id} from {url}")
             resp = self.session.get(url, headers=headers, timeout=TIMEOUT)
             
             if resp.status_code == 200:
                 return resp.text
-            
-            # --- DEBUG LOGGING ---
-            logger.error(f"❌ Koha API Error [Status {resp.status_code}]")
-            logger.error(f"Response: {resp.text[:200]}") # Перші 200 символів відповіді
             return None
-
         except Exception as e:
             logger.error(f"❌ Network error fetching #{biblio_id}: {e}")
             return None
@@ -43,29 +38,38 @@ class KohaClient:
         if not xml_data: return None
 
         record = self._parse_marc(xml_data)
-        if not record: 
-            logger.error(f"Failed to parse MARC for #{biblio_id}")
-            return None
+        if not record: return None
 
         fields_956 = record.get_fields('956')
-        if not fields_956: 
-            logger.warning(f"Field 956 not found in Biblio #{biblio_id}")
-            return None
+        if not fields_956: return None
         
         field = fields_956[0]
         return {
             "file_path": self._get_subfield_safe(field, 'u'),
             "collection_uuid": self._get_subfield_safe(field, 'x'),
-            "status": self._get_subfield_safe(field, 'y')
+            "status": self._get_subfield_safe(field, 'y'),
+            "dspace_uuid": self._get_subfield_safe(field, '3')
         }
+
+    # 🟢 НОВИЙ МЕТОД: Отримання дати оновлення
+    def get_biblio_timestamp(self, biblio_id: int):
+        """Повертає рядок дати оновлення запису (ISO 8601)"""
+        url = f"{self.base_url}/api/v1/biblios/{biblio_id}"
+        headers = {"Accept": "application/json"}
+        try:
+            resp = self.session.get(url, headers=headers, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                return resp.json().get('dateupdated') # або 'frameworkupdate'
+            return None
+        except: return None
 
     def set_status(self, biblio_id, status, msg=None):
         return self._update_956(biblio_id, status=status, log_msg=msg)
 
-    def set_success(self, biblio_id, handle_url):
-        return self._update_956(biblio_id, status="imported", handle_url=handle_url)
+    def set_success(self, biblio_id, handle_url, item_uuid=None):
+        return self._update_956(biblio_id, status="imported", handle_url=handle_url, item_uuid=item_uuid)
 
-    def _update_956(self, biblio_id, status=None, log_msg=None, handle_url=None):
+    def _update_956(self, biblio_id, status=None, log_msg=None, handle_url=None, item_uuid=None):
         xml_data = self._get_biblio_xml(biblio_id)
         if not xml_data: return False
         
@@ -77,10 +81,13 @@ class KohaClient:
                 try: f956.delete_subfield(code)
                 except: pass
             
-            if status: 
-                f956.add_subfield('y', status)
-            if log_msg: 
-                f956.add_subfield('z', str(log_msg)[:100])
+            if status: f956.add_subfield('y', status)
+            if log_msg: f956.add_subfield('z', str(log_msg)[:100])
+            
+            if item_uuid:
+                try: f956.delete_subfield('3')
+                except: pass
+                f956.add_subfield('3', item_uuid)
 
         if handle_url:
             for f in record.get_fields('856'): record.remove_field(f)
@@ -94,8 +101,6 @@ class KohaClient:
         try:
             resp = self.session.put(f"{self.base_url}/api/v1/biblios/{biblio_id}", 
                              data=new_xml.encode('utf-8'), headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"Failed to update Koha: {resp.status_code} - {resp.text}")
             return resp.status_code == 200
         except Exception as e:
             logger.error(f"Update error: {e}")

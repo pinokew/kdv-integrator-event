@@ -1,6 +1,9 @@
 # Ігнорувати файл з паролями
 .env
 Koha-intranet.js
+candidates.txt
+IntranetUserJS.js
+archive/
 
 # Логи
 *.log

@@ -35,10 +35,8 @@ class DSpaceClient:
                 self.token = resp.headers.get("Authorization")
                 self.session.headers.update({"Authorization": self.token})
                 self._update_xsrf_header()
-                logger.info(f"✅ DSpace Login Success ({DSPACE_USER})")
+                # logger.info(f"✅ DSpace Login Success ({DSPACE_USER})")
                 return True
-            
-            logger.error(f"❌ Login Failed: {resp.status_code} - {resp.text}")
             return False
         except Exception as e:
             logger.error(f"❌ Login Exception: {e}")
@@ -57,123 +55,90 @@ class DSpaceClient:
             self._update_xsrf_header()
             
             if resp.status_code == 401:
-                logger.warning("Token expired (401). Retrying login...")
                 if self.login():
                     resp = self.session.request(method, url, timeout=current_timeout, **kwargs)
-            
             return resp
         except Exception as e:
             logger.error(f"❌ Request Exception [{method} {endpoint}]: {e}")
             return None
 
     def find_item_uuid_by_handle(self, handle):
-        """
-        Шукає UUID запису за його Handle.
-        Використовує /api/pid/find (Identifier Resolution) замість пошуку.
-        """
-        # СТРАТЕГІЯ B: PID Resolution
-        # Цей запит поверне 303 Redirect на реальний об'єкт (Item)
-        # Requests автоматично перейде за редіректом і поверне JSON Item-а.
         endpoint = "/pid/find"
-        logger.info(f"🔎 Resolving Handle via PID: '{handle}'")
-        
         resp = self._request("GET", endpoint, params={"id": handle})
-        
-        if resp is not None:
-            if resp.status_code == 200:
-                # Якщо резолюція успішна, ми отримали сам об'єкт Item
-                try:
-                    data = resp.json()
-                    uuid = data.get('uuid')
-                    obj_type = data.get('type')
-                    
-                    if uuid and obj_type == 'item':
-                        logger.info(f"✅ Resolved UUID: {uuid}")
-                        return uuid
-                    else:
-                        logger.warning(f"⚠️ Handle resolved, but object is not an Item (Got {obj_type})")
-                except:
-                    logger.error(f"❌ Failed to parse JSON from resolved object.")
-            elif resp.status_code == 404:
-                logger.error(f"❌ Handle '{handle}' does not exist (404 Not Found)")
-            else:
-                logger.error(f"❌ Resolution failed [Status {resp.status_code}]")
-                logger.error(f"Response: {resp.text}")
-        else:
-             logger.error("❌ Resolution failed: No network response")
-             
+        if resp is not None and resp.status_code == 200:
+            try:
+                data = resp.json()
+                if data.get('uuid') and data.get('type') == 'item':
+                    return data.get('uuid')
+            except: pass
         return None
 
-    def update_metadata(self, item_uuid, title, author):
-        logger.info(f"Updating metadata for {item_uuid}")
+    def find_item_by_biblionumber(self, biblionumber):
+        endpoint = "/discover/search/objects"
+        query = f"koha.biblionumber:{biblionumber}"
+        params = {"query": query, "dsoType": "item"}
         
+        resp = self._request("GET", endpoint, params=params)
+        if resp is not None and resp.status_code == 200:
+            try:
+                data = resp.json()
+                results = data.get('_embedded', {}).get('searchResult', {}).get('_embedded', {}).get('objects', [])
+                if results:
+                    first_hit = results[0]['_embedded']['indexableObject']
+                    return {"uuid": first_hit['uuid'], "handle": first_hit.get('handle')}
+            except: pass
+        return None
+
+    # 🟢 НОВИЙ МЕТОД
+    def get_item_last_modified(self, item_uuid):
+        """Повертає рядок lastModified (ISO 8601) для Item"""
+        resp = self._request("GET", f"/core/items/{item_uuid}")
+        if resp and resp.status_code == 200:
+            return resp.json().get('lastModified')
+        return None
+
+    def _format_metadata_value(self, value):
+        if isinstance(value, list):
+            return [{"value": str(v), "language": None} for v in value]
+        return [{"value": str(value), "language": None}]
+
+    def update_metadata(self, item_uuid, metadata_dict):
         operations = []
-        operations.append({
-            "op": "replace",
-            "path": "/metadata/dc.title",
-            "value": [{"value": title, "language": None}]
-        })
+        for key, value in metadata_dict.items():
+            if key in ['handle', 'uuid'] or value is None: continue
+            dspace_values = self._format_metadata_value(value)
+            operations.append({"op": "replace", "path": f"/metadata/{key}", "value": dspace_values})
 
-        if author:
-            operations.append({
-                "op": "replace", 
-                "path": "/metadata/dc.contributor.author",
-                "value": [{"value": author, "language": None}]
-            })
+        if not operations: return True
 
-        old_ct = self.session.headers.get("Content-Type")
-        self.session.headers["Content-Type"] = "application/json-patch+json"
-        
-        try:
-            resp = self._request("PATCH", f"/core/items/{item_uuid}", json=operations)
-            if resp is not None and resp.status_code == 200:
-                logger.info("✅ Metadata Updated")
-                return True
-            else:
-                logger.error(f"❌ Update Failed: {resp.text if resp else 'No resp'}")
-                return False
-        finally:
-            if old_ct:
-                self.session.headers["Content-Type"] = old_ct
-            else:
-                del self.session.headers["Content-Type"]
+        headers = {"Content-Type": "application/json-patch+json"}
+        resp = self._request("PATCH", f"/core/items/{item_uuid}", json=operations, headers=headers)
+        return resp is not None and resp.status_code == 200
 
-    def create_item_direct(self, collection_uuid, title, author=None, koha_id=None):
-        logger.info(f"Creating Item in Collection {collection_uuid}...")
-        
-        metadata = {
-            "dc.title": [{"value": title, "language": None}],
-            "dc.date.issued": [{"value": str(time.localtime().tm_year), "language": None}],
-            "dc.type": [{"value": "Book", "language": None}]
-        }
-        if author: 
-            metadata["dc.contributor.author"] = [{"value": author, "language": None}]
+    def create_item_direct(self, collection_uuid, metadata_dict):
+        # ... (код створення без змін, для скорочення місця, він ідентичний v6.5) ...
+        dspace_metadata = {}
+        if 'dc.date.issued' not in metadata_dict or not metadata_dict['dc.date.issued']:
+             metadata_dict['dc.date.issued'] = str(time.localtime().tm_year)
+        if 'dc.type' not in metadata_dict or not metadata_dict['dc.type']:
+             metadata_dict['dc.type'] = "Book"
 
-        data = {
-            "name": title, 
-            "metadata": metadata, 
-            "inArchive": True, 
-            "discoverable": True
-        }
-        
+        for key, value in metadata_dict.items():
+            if key in ['handle', 'uuid'] or value is None: continue
+            dspace_metadata[key] = self._format_metadata_value(value)
+
+        name_val = metadata_dict.get('dc.title', 'Untitled')
+        if isinstance(name_val, list): name_val = name_val[0]
+
+        data = { "name": name_val, "metadata": dspace_metadata, "inArchive": True, "discoverable": True }
         resp = self._request("POST", "/core/items", params={"owningCollection": collection_uuid}, json=data)
         
         if resp is not None and resp.status_code in [200, 201]:
-            logger.info(f"✅ Item Created: {resp.json().get('uuid')}")
             return resp.json()
-        
-        if resp is not None:
-            logger.error(f"❌ Create Failed [Status {resp.status_code}]")
-            logger.error(f"Response: {resp.text}")
-        else:
-            logger.error("❌ Create Failed: No response from DSpace")
-            
         return None
 
     def upload_to_item(self, item_uuid, file_path):
-        if not os.path.exists(file_path): 
-            logger.error(f"❌ File not found on disk: {file_path}")
-            return False
+        if not os.path.exists(file_path): return False
         
         bundle_uuid = None
         resp = self._request("GET", f"/core/items/{item_uuid}/bundles")
@@ -182,30 +147,17 @@ class DSpaceClient:
                 if b['name'] == 'ORIGINAL': bundle_uuid = b['uuid']
         
         if not bundle_uuid:
-            logger.info("Creating ORIGINAL bundle...")
             resp = self._request("POST", f"/core/items/{item_uuid}/bundles", json={"name": "ORIGINAL"})
-            if resp is not None and resp.status_code in [200, 201]: 
-                bundle_uuid = resp.json()['uuid']
-            else: 
-                logger.error(f"❌ Failed to create bundle: {resp.text if resp else 'No resp'}")
-                return False
+            if resp and resp.status_code in [200, 201]: bundle_uuid = resp.json()['uuid']
+            else: return False
 
-        logger.info(f"Uploading file {os.path.basename(file_path)}...")
         old_ct = self.session.headers.pop("Content-Type", None)
         try:
             with open(file_path, 'rb') as f:
                 files = {'file': (os.path.basename(file_path), f, 'application/pdf')}
                 resp = self._request("POST", f"/core/bundles/{bundle_uuid}/bitstreams", 
                                      files=files, timeout=UPLOAD_TIMEOUT)
-                
-                if resp is not None and resp.status_code in [200, 201]:
-                    logger.info("✅ Upload Success")
-                    return True
-                else:
-                    logger.error(f"❌ Upload Failed: {resp.text if resp else 'No resp'}")
-                    return False
-        except Exception as e:
-            logger.error(f"Upload Exception: {e}")
-            return False
+                return resp and resp.status_code in [200, 201]
+        except Exception: return False
         finally:
             if old_ct: self.session.headers["Content-Type"] = old_ct

@@ -5,16 +5,14 @@ services:
     restart: unless-stopped
     
     # 🟢 1. Запуск Production сервера (Gunicorn) на порту 5000
-    command: gunicorn -w 4 -b 0.0.0.0:5000 src.app:app
+    command: /bin/sh /app/src/wait_for_drive.sh gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 src.app:app
     
     env_file:
       - .env
       
     environment:
       - TZ=Europe/Kyiv
-      # Якщо потрібно явно вказати шлях до диску, хоча він є в .env
       - INTEGRATOR_MOUNT_PATH=/mnt/drive
-
     volumes:
       - .:/app                 # Монтуємо код, щоб зміни підтягувались після перезапуску
       # 🟢 2. Обов'язково монтуємо диск (rclone), інакше скрипт не знайде PDF файли
