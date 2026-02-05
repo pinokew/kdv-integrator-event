@@ -3,6 +3,7 @@ import logging
 import shutil
 import re
 from flask import Flask, jsonify, request, abort, make_response
+from flask_cors import CORS
 from io import BytesIO
 from pymarc import parse_xml_to_array
 
@@ -11,11 +12,14 @@ from .config import setup_logging, KDV_API_TOKEN, INTEGRATOR_MOUNT_PATH, FOLDER_
 from .mapping import METADATA_RULES, TYPE_CONVERSION
 from .koha import KohaClient
 from .dspace import DSpaceClient
+from .covers import CoverService  # 🟢 Етап 6: Імпорт сервісу обкладинок
 
 setup_logging()
 logger = logging.getLogger("KDV-Core")
 
 app = Flask(__name__)
+# Додаємо CORS для браузера
+CORS(app)
 
 LIMIT_WARNING = 150 * 1024 * 1024
 LIMIT_ERROR = 250 * 1024 * 1024
@@ -99,6 +103,9 @@ def process_integration_logic(task_id, biblionumber):
     koha = KohaClient()
     dspace = DSpaceClient()
     
+    # Ініціалізація сервісу обкладинок з поточним клієнтом Koha
+    cover_service = CoverService(koha_client=koha)
+    
     # current_active_path буде зберігати актуальне місцезнаходження файлу
     current_active_path = None
 
@@ -132,6 +139,24 @@ def process_integration_logic(task_id, biblionumber):
         
         # Тепер ми працюємо з файлом у папці Processed
         current_active_path = versioned_path
+
+        # --- 🟢 2.1 COVER AUTOMATOR (Phase 6) ---
+        # Виконуємо генерацію ПІСЛЯ переміщення файлу, щоб читати стабільний шлях.
+        try:
+            logger.info(f"🎨 [Cover] Starting generation for #{biblionumber}")
+            # Визначаємо папку для збереження (Processed або поруч з файлом)
+            pdf_dir = os.path.dirname(current_active_path)
+            
+            cover_result = cover_service.process_book(
+                biblionumber=str(biblionumber),
+                pdf_path=current_active_path,
+                output_base_dir=pdf_dir
+            )
+            logger.info(f"🖼️ [Cover] Service Result: {cover_result}")
+        except Exception as cover_e:
+            # Stability Guard: Не зупиняємо основний процес
+            logger.warning(f"⚠️ [Cover] Generation failed (continuing integration): {cover_e}")
+        # ----------------------------------------
 
         # --- 3. PREPARE METADATA ---
         raw_xml = koha._get_biblio_xml(biblionumber)

@@ -3,6 +3,7 @@ services:
     build: .
     container_name: kdv-api
     restart: unless-stopped
+    privileged: true
     
     # 🟢 1. Запуск Production сервера (Gunicorn) на порту 5000
     command: /bin/sh /app/src/wait_for_drive.sh gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 src.app:app
@@ -16,7 +17,7 @@ services:
     volumes:
       - .:/app                 # Монтуємо код, щоб зміни підтягувались після перезапуску
       # 🟢 2. Обов'язково монтуємо диск (rclone), інакше скрипт не знайде PDF файли
-      - ${INTEGRATOR_MOUNT_PATH}:/mnt/drive
+      - ${INTEGRATOR_MOUNT_PATH}:/mnt/drive:rslave
       
     networks:
       - dspacenet

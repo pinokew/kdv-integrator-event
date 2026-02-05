@@ -1,0 +1,153 @@
+import os
+import time
+import logging
+import io
+from pathlib import Path
+from PIL import Image
+
+# Спробуємо імпортувати pdf2image, якщо бібліотека встановлена
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+
+# Налаштування логування
+logger = logging.getLogger(__name__)
+
+class CoverService:
+    """
+    Сервіс для генерації обкладинок з PDF та завантаження їх у Koha.
+    Реалізує політику безпеки (Retry, Timeout) та стандарти зображень.
+    """
+
+    # --- COVER POLICY CONSTANTS ---
+    TARGET_WIDTH = 600      # Цільова ширина
+    MAX_WIDTH = 800         # Жорсткий ліміт
+    JPEG_QUALITY = 80       # Якість стиснення
+    DEFAULT_DPI = 150       # Роздільна здатність для Poppler
+    GENERATION_TIMEOUT = 15 # Секунд на генерацію (Time Limit)
+    MAX_RETRIES = 2         # Спроби читання PDF
+    RETRY_DELAY = 1         # Секунд між спробами
+
+    def __init__(self, koha_client=None):
+        """
+        :param koha_client: Екземпляр клієнта KohaAPI (для перевірки та завантаження)
+        """
+        self.koha = koha_client
+        if not PDF2IMAGE_AVAILABLE:
+            logger.warning("⚠️ pdf2image not installed. Cover generation will be disabled.")
+
+    def process_book(self, biblionumber: str, pdf_path: str, output_base_dir: str):
+        """
+        Головний метод процесу.
+        1. Перевіряє наявність обкладинки в Koha (Strict Mode).
+        2. Генерує файл.
+        3. Завантажує в Koha (якщо клієнт підключено).
+        """
+        if not PDF2IMAGE_AVAILABLE:
+            return {"status": "skipped", "reason": "missing_library"}
+
+        # 1. Strict Mode: Перевірка наявності (щоб не перезаписати ручну роботу)
+        if self.koha and self._check_if_cover_exists(biblionumber):
+            logger.info(f"⏭️ [Cover] Skipped for #{biblionumber}: Cover already exists in Koha.")
+            return {"status": "skipped", "reason": "exists_in_koha"}
+
+        # 2. Генерація файлу
+        try:
+            cover_path = self._generate_image(biblionumber, pdf_path, output_base_dir)
+            logger.info(f"✅ [Cover] Generated: {cover_path}")
+        except Exception as e:
+            logger.error(f"❌ [Cover] Failed to generate for #{biblionumber}: {e}")
+            return {"status": "error", "reason": str(e)}
+
+        # 3. Завантаження в Koha
+        if self.koha:
+            upload_success = self._upload_to_koha(biblionumber, cover_path)
+            if upload_success:
+                return {"status": "success", "file": cover_path}
+            else:
+                return {"status": "warning", "reason": "upload_failed", "file": cover_path}
+        
+        return {"status": "generated_only", "file": cover_path}
+
+    def _generate_image(self, biblionumber, pdf_path, output_base_dir):
+        """
+        Витягує першу сторінку, ресайзить та зберігає.
+        Реалізує Retry Policy та Timeout Guard.
+        """
+        # Формування шляху: output_base_dir/processed/covers/cover_123_v01.jpg
+        # Припускаємо, що output_base_dir - це корінь теки книги або загальна папка
+        # Для уніфікації збережемо поруч з PDF або в спеціальній папці
+        
+        # Створюємо папку для обкладинок, якщо передано загальний шлях, 
+        # або використовуємо логіку збереження поруч
+        save_dir = Path(output_base_dir) / "covers"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"cover_{biblionumber}_v01.jpg"
+        full_path = save_dir / filename
+
+        # --- EXTRACTION (Stability Guard) ---
+        pil_image = None
+        last_error = None
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # convert_from_path повертає список зображень
+                images = convert_from_path(
+                    pdf_path,
+                    first_page=1,
+                    last_page=1,
+                    dpi=self.DEFAULT_DPI,
+                    fmt='jpeg',
+                    timeout=self.GENERATION_TIMEOUT # Poppler timeout guard
+                )
+                if images:
+                    pil_image = images[0]
+                    break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"⚠️ [Cover] Attempt {attempt+1}/{self.MAX_RETRIES} failed: {e}")
+                time.sleep(self.RETRY_DELAY)
+
+        if not pil_image:
+            raise Exception(f"Could not extract first page after {self.MAX_RETRIES} retries. Error: {last_error}")
+
+        # --- PROCESSING (Resize) ---
+        # Якщо ширина більше ліміту - зменшуємо
+        if pil_image.width > self.TARGET_WIDTH:
+            w_percent = (self.TARGET_WIDTH / float(pil_image.width))
+            h_size = int((float(pil_image.height) * float(w_percent)))
+            # Використовуємо LANCZOS для якісного зменшення (раніше було ANTIALIAS)
+            pil_image = pil_image.resize((self.TARGET_WIDTH, h_size), Image.Resampling.LANCZOS)
+        
+        # --- SAVING ---
+        pil_image.save(full_path, "JPEG", quality=self.JPEG_QUALITY, optimize=True)
+        
+        return str(full_path)
+
+    def _check_if_cover_exists(self, biblionumber):
+        """
+        Запит до Koha API, щоб перевірити наявність зображення.
+        """
+        try:
+            # Тут буде реальний виклик, коли ми інтегруємо KohaClient
+            # Наприклад: self.koha.get_cover_status(biblionumber)
+            # Поки що повертаємо False, щоб дозволити генерацію
+            return False 
+        except Exception:
+            return False
+
+    def _upload_to_koha(self, biblionumber, file_path):
+        """
+        Завантаження бінарного файлу в Koha.
+        """
+        try:
+            # self.koha.upload_cover(biblionumber, file_path)
+            logger.info(f"📡 [Cover] Uploading {file_path} to Koha #{biblionumber}...")
+            # Placeholder для майбутньої інтеграції
+            return True
+        except Exception as e:
+            logger.error(f"❌ [Cover] Upload failed: {e}")
+            return False

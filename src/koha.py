@@ -1,6 +1,7 @@
 import requests
 import logging
 import pymarc
+import os  # Додано для перевірки існування файлу
 from io import BytesIO
 from pymarc import parse_xml_to_array, Field, Subfield
 from requests.auth import HTTPBasicAuth
@@ -51,7 +52,6 @@ class KohaClient:
             "dspace_uuid": self._get_subfield_safe(field, '3')
         }
 
-    # 🟢 НОВИЙ МЕТОД: Отримання дати оновлення
     def get_biblio_timestamp(self, biblio_id: int):
         """Повертає рядок дати оновлення запису (ISO 8601)"""
         url = f"{self.base_url}/api/v1/biblios/{biblio_id}"
@@ -59,9 +59,66 @@ class KohaClient:
         try:
             resp = self.session.get(url, headers=headers, timeout=TIMEOUT)
             if resp.status_code == 200:
-                return resp.json().get('dateupdated') # або 'frameworkupdate'
+                return resp.json().get('dateupdated')
             return None
         except: return None
+
+    # --- 🟢 COVER METHODS (Phase 6) ---
+
+    def check_cover_exists(self, biblionumber):
+        """
+        Перевіряє, чи є локальна обкладинка.
+        Виконує GET запит. Якщо 200 - обкладинка є.
+        """
+        url = f"{self.base_url}/api/v1/biblios/{biblionumber}/cover"
+        try:
+            # Використовуємо stream=True, щоб не завантажувати картинку, якщо вона велика
+            resp = self.session.get(url, stream=True, timeout=5)
+            if resp.status_code == 200:
+                resp.close()
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to check cover status for #{biblionumber}: {e}")
+            return False
+
+    def upload_cover(self, biblionumber, file_path):
+        """
+        Завантажує файл обкладинки в Koha.
+        POST /api/v1/biblios/{biblionumber}/cover
+        """
+        if not os.path.exists(file_path):
+            logger.error(f"Cover file not found: {file_path}")
+            return False
+
+        url = f"{self.base_url}/api/v1/biblios/{biblionumber}/cover"
+        
+        # Визначаємо Content-Type (image/jpeg або image/png)
+        content_type = "image/png" if file_path.lower().endswith('.png') else "image/jpeg"
+        
+        headers = {
+            "Content-Type": content_type,
+            "Accept": "application/json"
+        }
+
+        try:
+            with open(file_path, 'rb') as f:
+                image_data = f.read()
+            
+            # Важливо: data=image_data відправляє raw binary body
+            resp = self.session.post(url, data=image_data, headers=headers, timeout=15)
+            
+            if resp.status_code in [200, 201, 204]:
+                logger.info(f"✅ Cover uploaded for Biblio #{biblionumber}")
+                return True
+            else:
+                logger.error(f"❌ Cover upload failed. Status: {resp.status_code}. Body: {resp.text}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Cover upload error for #{biblionumber}: {e}")
+            return False
+
+    # -----------------------------------
 
     def set_status(self, biblio_id, status, msg=None):
         return self._update_956(biblio_id, status=status, log_msg=msg)
