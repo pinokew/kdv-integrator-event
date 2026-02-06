@@ -63,10 +63,14 @@ class CoverService:
 
         # 3. Завантаження в Koha
         if self.koha:
+            # 🔴 ТУТ БУЛА ЗАГЛУШКА. ТЕПЕР РЕАЛЬНИЙ ВИКЛИК.
             upload_success = self._upload_to_koha(biblionumber, cover_path)
+            
             if upload_success:
+                logger.info(f"✅ [Cover] Successfully uploaded to Koha #{biblionumber}")
                 return {"status": "success", "file": cover_path}
             else:
+                logger.warning(f"⚠️ [Cover] Upload returned False for #{biblionumber}")
                 return {"status": "warning", "reason": "upload_failed", "file": cover_path}
         
         return {"status": "generated_only", "file": cover_path}
@@ -76,12 +80,7 @@ class CoverService:
         Витягує першу сторінку, ресайзить та зберігає.
         Реалізує Retry Policy та Timeout Guard.
         """
-        # Формування шляху: output_base_dir/processed/covers/cover_123_v01.jpg
-        # Припускаємо, що output_base_dir - це корінь теки книги або загальна папка
-        # Для уніфікації збережемо поруч з PDF або в спеціальній папці
-        
-        # Створюємо папку для обкладинок, якщо передано загальний шлях, 
-        # або використовуємо логіку збереження поруч
+        # Створюємо папку для обкладинок
         save_dir = Path(output_base_dir) / "covers"
         save_dir.mkdir(parents=True, exist_ok=True)
         
@@ -119,7 +118,7 @@ class CoverService:
         if pil_image.width > self.TARGET_WIDTH:
             w_percent = (self.TARGET_WIDTH / float(pil_image.width))
             h_size = int((float(pil_image.height) * float(w_percent)))
-            # Використовуємо LANCZOS для якісного зменшення (раніше було ANTIALIAS)
+            # Використовуємо LANCZOS для якісного зменшення
             pil_image = pil_image.resize((self.TARGET_WIDTH, h_size), Image.Resampling.LANCZOS)
         
         # --- SAVING ---
@@ -132,10 +131,7 @@ class CoverService:
         Запит до Koha API, щоб перевірити наявність зображення.
         """
         try:
-            # Тут буде реальний виклик, коли ми інтегруємо KohaClient
-            # Наприклад: self.koha.get_cover_status(biblionumber)
-            # Поки що повертаємо False, щоб дозволити генерацію
-            return False 
+            return self.koha.check_cover_exists(biblionumber)
         except Exception:
             return False
 
@@ -144,10 +140,9 @@ class CoverService:
         Завантаження бінарного файлу в Koha.
         """
         try:
-            # self.koha.upload_cover(biblionumber, file_path)
             logger.info(f"📡 [Cover] Uploading {file_path} to Koha #{biblionumber}...")
-            # Placeholder для майбутньої інтеграції
-            return True
+            # Викликаємо метод з src/koha.py
+            return self.koha.upload_cover(biblionumber, file_path)
         except Exception as e:
             logger.error(f"❌ [Cover] Upload failed: {e}")
             return False

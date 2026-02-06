@@ -1,8 +1,12 @@
 import requests
 import logging
 import pymarc
-import os  # Додано для перевірки існування файлу
+import os
+import re
+import json
+import time
 from io import BytesIO
+from urllib.parse import urljoin
 from pymarc import parse_xml_to_array, Field, Subfield
 from requests.auth import HTTPBasicAuth
 
@@ -19,14 +23,24 @@ class KohaClient:
             "Content-Type": "application/json",
             "Accept": "application/json"
         })
+        
+        # Окрема сесія для CGI операцій (емуляція браузера)
+        self.cgi_session = requests.Session()
+        self.cgi_session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
+
+    # --- STANDARD MARC API METHODS ---
 
     def _get_biblio_xml(self, biblio_id):
         url = f"{self.base_url}/api/v1/biblios/{biblio_id}"
         headers = {"Accept": "application/marcxml+xml"}
         try:
-            # logger.info(f"Fetching Biblio #{biblio_id} from {url}")
             resp = self.session.get(url, headers=headers, timeout=TIMEOUT)
-            
             if resp.status_code == 200:
                 return resp.text
             return None
@@ -51,9 +65,8 @@ class KohaClient:
             "status": self._get_subfield_safe(field, 'y'),
             "dspace_uuid": self._get_subfield_safe(field, '3')
         }
-
+    
     def get_biblio_timestamp(self, biblio_id: int):
-        """Повертає рядок дати оновлення запису (ISO 8601)"""
         url = f"{self.base_url}/api/v1/biblios/{biblio_id}"
         headers = {"Accept": "application/json"}
         try:
@@ -63,62 +76,173 @@ class KohaClient:
             return None
         except: return None
 
-    # --- 🟢 COVER METHODS (Phase 6) ---
+    # --- 🟢 ROBUST COVER UPLOAD (Two-Step CGI) ---
 
     def check_cover_exists(self, biblionumber):
-        """
-        Перевіряє, чи є локальна обкладинка.
-        Виконує GET запит. Якщо 200 - обкладинка є.
-        """
+        """Перевірка наявності обкладинки (швидкий REST GET)."""
         url = f"{self.base_url}/api/v1/biblios/{biblionumber}/cover"
         try:
-            # Використовуємо stream=True, щоб не завантажувати картинку, якщо вона велика
             resp = self.session.get(url, stream=True, timeout=5)
             if resp.status_code == 200:
                 resp.close()
                 return True
-            return False
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to check cover status for #{biblionumber}: {e}")
-            return False
+        except: pass
+        return False
 
     def upload_cover(self, biblionumber, file_path):
         """
-        Завантажує файл обкладинки в Koha.
-        POST /api/v1/biblios/{biblionumber}/cover
+        Головний метод завантаження.
+        Реалізує складну логіку авторизації та двоетапного завантаження (Temp -> Process).
         """
         if not os.path.exists(file_path):
             logger.error(f"Cover file not found: {file_path}")
             return False
 
-        url = f"{self.base_url}/api/v1/biblios/{biblionumber}/cover"
-        
-        # Визначаємо Content-Type (image/jpeg або image/png)
-        content_type = "image/png" if file_path.lower().endswith('.png') else "image/jpeg"
-        
-        headers = {
-            "Content-Type": content_type,
-            "Accept": "application/json"
-        }
-
-        try:
-            with open(file_path, 'rb') as f:
-                image_data = f.read()
-            
-            # Важливо: data=image_data відправляє raw binary body
-            resp = self.session.post(url, data=image_data, headers=headers, timeout=15)
-            
-            if resp.status_code in [200, 201, 204]:
-                logger.info(f"✅ Cover uploaded for Biblio #{biblionumber}")
-                return True
-            else:
-                logger.error(f"❌ Cover upload failed. Status: {resp.status_code}. Body: {resp.text}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Cover upload error for #{biblionumber}: {e}")
+        # 1. Авторизація (якщо сесія втрачена)
+        if not self._ensure_cgi_login():
+            logger.error(f"❌ Failed to login to Koha CGI for #{biblionumber}")
             return False
 
-    # -----------------------------------
+        # 2. Отримання сторінки інструментів (для свіжого CSRF)
+        upload_tool_url = f"{self.base_url}/cgi-bin/koha/tools/upload-cover-image.pl"
+        try:
+            resp_tool = self.cgi_session.get(upload_tool_url, params={'biblionumber': biblionumber}, timeout=15)
+            tool_csrf = self._extract_csrf(resp_tool.text)
+            
+            if not tool_csrf:
+                logger.error("❌ Could not get CSRF token from tools page")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Error fetching upload form: {e}")
+            return False
+
+        # 3. КРОК 1: Завантаження в тимчасове сховище (AJAX)
+        temp_file_id = self._step1_upload_temp(file_path, tool_csrf, upload_tool_url)
+        if not temp_file_id:
+            logger.error(f"❌ Step 1 (Temp Upload) failed for #{biblionumber}")
+            return False
+        
+        # Пауза для синхронізації БД (про всяк випадок)
+        time.sleep(1)
+
+        # 4. КРОК 2: Прив'язка файлу до запису
+        return self._step2_process_attach(biblionumber, temp_file_id, tool_csrf, upload_tool_url)
+
+    def _step1_upload_temp(self, file_path, csrf_token, referer_url):
+        """Завантажує файл на сервер і повертає його ID."""
+        temp_url = f"{self.base_url}/cgi-bin/koha/tools/upload-file.pl?temp=1"
+        
+        # 🟢 ВИПРАВЛЕНО: Заголовки строго як у успішному debug_step2_upload.py
+        # Прибрано X-Requested-With, додано Sec-Fetch-* та Accept: */*
+        headers = {
+            'Referer': referer_url,
+            'CSRF-TOKEN': csrf_token,
+            'Accept': '*/*', 
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
+        }
+        
+        try:
+            with open(file_path, 'rb') as f:
+                files = {'file': (os.path.basename(file_path), f, 'image/jpeg')}
+                # data=None (пусто)
+                resp = self.cgi_session.post(temp_url, files=files, headers=headers, timeout=30)
+                
+                try:
+                    res_json = resp.json()
+                    file_id = res_json.get('fileid')
+                    if not file_id and 'uploads' in res_json and len(res_json['uploads']) > 0:
+                        file_id = res_json['uploads'][0].get('file_id')
+                    
+                    if file_id:
+                        logger.info(f"✅ Temp file uploaded. ID: {file_id}")
+                        return file_id
+                    else:
+                        logger.error(f"Temp upload returned JSON without ID: {res_json}")
+                except:
+                    logger.error(f"Failed to parse temp upload response: {resp.text[:200]}")
+                    
+        except Exception as e:
+            logger.error(f"Temp upload exception: {e}")
+        
+        return None
+
+    def _step2_process_attach(self, biblionumber, file_id, csrf_token, tool_url):
+        """Прив'язує завантажений файл (ID) до бібліографічного запису."""
+        payload = {
+            'biblionumber': str(biblionumber),
+            'filetype': 'image',
+            'op': 'cud-process', 
+            'uploadedfileid': str(file_id),
+            'replace': '1',
+            'csrf_token': csrf_token
+        }
+        
+        headers = {'Referer': tool_url}
+        
+        try:
+            resp = self.cgi_session.post(tool_url, data=payload, headers=headers, timeout=30)
+            
+            # Перевірка успіху: редірект або текст
+            if "itemnumber=" in resp.url or "successful" in resp.text or "успішно" in resp.text:
+                logger.info(f"✅ Cover successfully attached to #{biblionumber}")
+                return True
+            elif "upload_results" in resp.text:
+                logger.info(f"✅ Cover upload likely successful (found results div)")
+                return True
+            else:
+                logger.warning(f"⚠️ Cover attach response unclear. URL: {resp.url}")
+                return True 
+                
+        except Exception as e:
+            logger.error(f"Attach exception: {e}")
+            return False
+
+    def _ensure_cgi_login(self):
+        """Гарантує, що ми залогінені в CGI сесії."""
+        entry_url = f"{self.base_url}/cgi-bin/koha/mainpage.pl"
+        
+        try:
+            # Перевірка: чи ми вже там?
+            resp_check = self.cgi_session.get(entry_url, timeout=10)
+            if "Log out" in resp_check.text or "Вихід" in resp_check.text:
+                return True
+            
+            # Якщо ні - логінимось
+            csrf_token = self._extract_csrf(resp_check.text)
+            
+            # Шукаємо action форми
+            action_match = re.search(r'<form[^>]+action="([^"]+)"', resp_check.text)
+            login_url = urljoin(resp_check.url, action_match.group(1)) if action_match else resp_check.url
+            
+            payload = {
+                "userid": KOHA_USER, "password": KOHA_PASS,
+                "koha_login_context": "intranet", "op": "cud-login"
+            }
+            if csrf_token: payload["csrf_token"] = csrf_token
+            
+            resp_login = self.cgi_session.post(login_url, data=payload, headers={'Referer': entry_url}, timeout=15)
+            
+            if "Log out" in resp_login.text or "Вихід" in resp_login.text or "mainpage.pl" in resp_login.url:
+                logger.info("✅ CGI Login Successful")
+                return True
+            
+            logger.error(f"CGI Login Failed. Final URL: {resp_login.url}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Login process error: {e}")
+            return False
+
+    def _extract_csrf(self, html):
+        match_input = re.search(r'<input\s+type="hidden"\s+name="csrf_token"\s+value="([^"]+)"', html)
+        if match_input: return match_input.group(1)
+        match_meta = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
+        if match_meta: return match_meta.group(1)
+        return None
+
+    # --- HELPERS (UPDATE MARC) ---
 
     def set_status(self, biblio_id, status, msg=None):
         return self._update_956(biblio_id, status=status, log_msg=msg)
