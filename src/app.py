@@ -2,64 +2,55 @@ import os
 import logging
 import shutil
 import re
-from flask import Flask, jsonify, request, abort, make_response
+import time  # 🟢 NEW: Потрібно для пауз при повторних спробах
+import concurrent.futures
+from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from io import BytesIO
 from pymarc import parse_xml_to_array
 
 from .tasks import task_manager
-from .config import setup_logging, KDV_API_TOKEN, INTEGRATOR_MOUNT_PATH, FOLDER_PROCESSED, FOLDER_ERROR, DSPACE_UI_URL
+from .config import setup_logging, KDV_API_TOKEN, KOHA_API_URL, INTEGRATOR_MOUNT_PATH, FOLDER_PROCESSED, FOLDER_ERROR, DSPACE_UI_URL
 from .mapping import METADATA_RULES, TYPE_CONVERSION
 from .koha import KohaClient
 from .dspace import DSpaceClient
-from .covers import CoverService  # 🟢 Етап 6: Імпорт сервісу обкладинок
+from .covers import CoverService
 
 setup_logging()
 logger = logging.getLogger("KDV-Core")
 
 app = Flask(__name__)
-# Додаємо CORS для браузера
 CORS(app)
 
 LIMIT_WARNING = 150 * 1024 * 1024
 LIMIT_ERROR = 250 * 1024 * 1024
 
 def get_versioned_path(base_dir, biblionumber):
-    """
-    Генерує унікальний шлях для файлу з версійністю.
-    Патерн: {base_dir}/Processed/biblio_{id}_v{XX}.pdf
-    """
+    """Генерує унікальний шлях для файлу з версійністю."""
     target_dir = os.path.join(base_dir, FOLDER_PROCESSED)
     os.makedirs(target_dir, exist_ok=True)
-    
     version = 1
     while True:
         filename = f"biblio_{biblionumber}_v{version:02d}.pdf"
         full_path = os.path.join(target_dir, filename)
-        
         if not os.path.exists(full_path):
             return full_path
-        
         version += 1
         if version > 999:
-            return os.path.join(target_dir, f"biblio_{biblionumber}_v999_overflow_{os.urandom(4).hex()}.pdf")
+            return os.path.join(target_dir, f"biblio_{biblionumber}_v999_{os.urandom(4).hex()}.pdf")
 
 def parse_marc_details(xml_data):
-    """Універсальний парсер MARC на основі правил з mapping.py."""
     try:
         reader = parse_xml_to_array(BytesIO(xml_data.encode('utf-8')))
         record = reader[0]
         extracted_data = {}
-
         for dspace_field, rule in METADATA_RULES.items():
             values = []
             sources = rule.get('sources', [{"tag": rule.get("tag"), "subfield": rule.get("subfield")}])
-            
             for src in sources:
                 tag = src.get('tag')
                 sub = src.get('subfield')
                 if not tag or tag not in record: continue
-
                 if rule.get('multivalue'):
                     for field in record.get_fields(tag):
                         val = field[sub] if sub in field else None
@@ -69,7 +60,6 @@ def parse_marc_details(xml_data):
                     if val:
                         values.append(val)
                         break 
-
             final_values = []
             for v in values:
                 if 'regex' in rule:
@@ -79,38 +69,65 @@ def parse_marc_details(xml_data):
                 if 'conversion' in rule and rule['conversion'] == 'type':
                     v = TYPE_CONVERSION.get(v, TYPE_CONVERSION.get("DEFAULT"))
                 final_values.append(v)
-
             if final_values:
-                if rule.get('multivalue'):
-                    extracted_data[dspace_field] = final_values
-                else:
-                    extracted_data[dspace_field] = final_values[0]
-
+                extracted_data[dspace_field] = final_values if rule.get('multivalue') else final_values[0]
         handle = None
         if '856' in record and 'u' in record['856']:
             full_url = record['856']['u']
             match = re.search(r'handle/(\d+/\d+)', full_url)
             if match: handle = match.group(1)
         extracted_data['handle'] = handle
-
         return extracted_data
     except Exception as e:
         logger.warning(f"Could not parse MARC details: {e}")
         return {}
 
+def run_dspace_workflow(biblionumber, file_path, meta):
+    """
+    THREAD: Critical DSpace Logic
+    """
+    local_koha = KohaClient()
+    local_dspace = DSpaceClient()
+    
+    logger.info(f"🚀 [DSpace-Thread] Starting metadata & upload for #{biblionumber}")
+    
+    raw_xml = local_koha._get_biblio_xml(biblionumber)
+    md = parse_marc_details(raw_xml)
+    md['koha.biblionumber'] = str(biblionumber)
+    
+    collection_uuid = meta['collection_uuid']
+    if not collection_uuid: raise Exception("Collection UUID missing")
+
+    existing_item = local_dspace.find_item_by_biblionumber(biblionumber)
+    if existing_item:
+        logger.warning(f"🔄 Item already exists (UUID: {existing_item['uuid']}). Linking only.")
+        item_uuid = existing_item['uuid']
+        handle = existing_item.get('handle')
+        final_link = f"{DSPACE_UI_URL}/handle/{handle}" if handle else f"{DSPACE_UI_URL}/items/{item_uuid}"
+        return {"handle": final_link, "uuid": item_uuid, "status": "linked_existing"}
+
+    item_data = local_dspace.create_item_direct(collection_uuid, md)
+    if not item_data: raise Exception("Failed to create item in DSpace")
+
+    item_uuid = item_data['uuid']
+    handle = item_data.get('handle')
+    final_link = f"{DSPACE_UI_URL}/handle/{handle}" if handle else f"{DSPACE_UI_URL}/items/{item_uuid}"
+
+    logger.info(f"📤 [DSpace-Thread] Uploading file to Item {item_uuid}")
+    if not local_dspace.upload_to_item(item_uuid, file_path):
+        raise Exception("Failed to upload file")
+
+    logger.info(f"✅ [DSpace-Thread] Finished for #{biblionumber}")
+    return {"handle": final_link, "uuid": item_uuid}
+
 def process_integration_logic(task_id, biblionumber):
-    logger.info(f"⚙️ [Thread] Processing Biblio #{biblionumber}")
+    logger.info(f"⚙️ [Core] Processing Biblio #{biblionumber}")
     koha = KohaClient()
-    dspace = DSpaceClient()
-    
-    # Ініціалізація сервісу обкладинок з поточним клієнтом Koha
     cover_service = CoverService(koha_client=koha)
-    
-    # current_active_path буде зберігати актуальне місцезнаходження файлу
     current_active_path = None
 
     try:
-        # --- 1. CHECKS & METADATA ---
+        # --- 1. SERIAL PHASE: Checks & Rename ---
         meta = koha.get_biblio_metadata(biblionumber)
         if not meta: raise Exception("No 956 field found")
 
@@ -121,7 +138,6 @@ def process_integration_logic(task_id, biblionumber):
             koha.set_status(biblionumber, 'error', f"File missing: {file_rel_path}")
             raise Exception("File not found on disk")
 
-        # Size Policy
         file_size = os.path.getsize(original_full_path)
         if file_size > LIMIT_ERROR:
             msg = f"FILE TOO LARGE ({round(file_size/1024/1024)} MB)"
@@ -130,102 +146,85 @@ def process_integration_logic(task_id, biblionumber):
         if file_size > LIMIT_WARNING:
             koha.set_status(biblionumber, None, f"Warning: {round(file_size/1024/1024)} MB")
 
-        # --- 🟢 2. RENAME FIRST (Move to Processed) ---
         source_dir = os.path.dirname(original_full_path)
         versioned_path = get_versioned_path(source_dir, biblionumber)
         
-        logger.info(f"📂 Renaming and moving to Processed: {versioned_path}")
+        logger.info(f"📂 [Core] Renaming to: {versioned_path}")
         shutil.move(original_full_path, versioned_path)
-        
-        # Тепер ми працюємо з файлом у папці Processed
         current_active_path = versioned_path
 
-        # --- 🟢 2.1 COVER AUTOMATOR (Phase 6) ---
-        # Виконуємо генерацію ПІСЛЯ переміщення файлу, щоб читати стабільний шлях.
-        try:
-            logger.info(f"🎨 [Cover] Starting generation for #{biblionumber}")
-            # Визначаємо папку для збереження (Processed або поруч з файлом)
-            pdf_dir = os.path.dirname(current_active_path)
-            
-            cover_result = cover_service.process_book(
-                biblionumber=str(biblionumber),
-                pdf_path=current_active_path,
-                output_base_dir=pdf_dir
-            )
-            logger.info(f"🖼️ [Cover] Service Result: {cover_result}")
-        except Exception as cover_e:
-            # Stability Guard: Не зупиняємо основний процес
-            logger.warning(f"⚠️ [Cover] Generation failed (continuing integration): {cover_e}")
-        # ----------------------------------------
-
-        # --- 3. PREPARE METADATA ---
-        raw_xml = koha._get_biblio_xml(biblionumber)
-        md = parse_marc_details(raw_xml)
-        md['koha.biblionumber'] = str(biblionumber)
+        # --- ⚡ 2. PARALLEL PHASE: DSpace + Cover ---
+        dspace_result = None
+        cover_url = None
         
-        logger.info(f"Parsed Metadata: {md}")
-
-        collection_uuid = meta['collection_uuid']
-        if not collection_uuid: raise Exception("Collection UUID missing")
-
-        # --- 4. DUPLICATE CHECK ---
-        existing_item = dspace.find_item_by_biblionumber(biblionumber)
-        if existing_item:
-            logger.warning(f"🔄 Item already exists (UUID: {existing_item['uuid']}). Linking only.")
-            item_uuid = existing_item['uuid']
-            handle = existing_item.get('handle')
-            final_link = f"{DSPACE_UI_URL}/handle/{handle}" if handle else f"{DSPACE_UI_URL}/items/{item_uuid}"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            # Task A: Cover
+            pdf_dir = os.path.dirname(current_active_path)
+            future_cover = executor.submit(cover_service.process_book, str(biblionumber), current_active_path, pdf_dir)
             
-            koha.set_success(biblionumber, final_link, item_uuid=item_uuid)
-            # Файл вже у Processed, все добре.
-            return {"handle": final_link, "uuid": item_uuid, "status": "linked_existing"}
+            # Task B: DSpace
+            future_dspace = executor.submit(run_dspace_workflow, biblionumber, current_active_path, meta)
+            
+            logger.info("⚡ [Core] Parallel tasks started: Cover + DSpace")
 
-        # --- 5. CREATE ITEM ---
-        item_data = dspace.create_item_direct(collection_uuid, md)
-        if not item_data: raise Exception("Failed to create item in DSpace")
+            # Check Critical Task (DSpace)
+            try:
+                dspace_result = future_dspace.result()
+            except Exception as e:
+                logger.error(f"❌ [Core] DSpace Thread failed: {e}")
+                raise e
 
-        item_uuid = item_data['uuid']
-        handle = item_data.get('handle')
-        final_link = f"{DSPACE_UI_URL}/handle/{handle}" if handle else f"{DSPACE_UI_URL}/items/{item_uuid}"
+            # Check Bonus Task (Cover)
+            try:
+                cover_res = future_cover.result(timeout=10)
+                logger.info(f"🖼️ [Core] Cover result: {cover_res}")
+                
+                # 🟢 NEW: Retry Logic для отримання URL
+                if cover_res.get('status') in ['success', 'skipped']:
+                     # Робимо до 3 спроб з паузою, щоб Koha API встигло побачити картинку
+                     for attempt in range(3):
+                         real_url = koha.get_cover_image_url(biblionumber)
+                         if real_url:
+                             logger.info(f"🔗 [Core] Resolved Cover URL: {real_url}")
+                             cover_url = real_url
+                             break
+                         else:
+                             logger.info(f"⏳ [Core] Waiting for cover API index (attempt {attempt+1}/3)...")
+                             time.sleep(1)
+                     
+            except concurrent.futures.TimeoutError:
+                logger.warning("⚠️ [Core] Cover generation timeout.")
+            except Exception as e:
+                logger.warning(f"⚠️ [Core] Cover Thread warning: {e}")
 
-        # --- 🟢 6. UPLOAD (Using Renamed File) ---
-        # Тепер DSpace отримає файл з ім'ям "biblio_123_v01.pdf"
-        if not dspace.upload_to_item(item_uuid, current_active_path):
-            raise Exception("Failed to upload file")
+        # --- 3. FINALIZE ---
+        if dspace_result:
+            koha.set_success(
+                biblionumber, 
+                dspace_result['handle'], 
+                item_uuid=dspace_result['uuid'],
+                cover_url=cover_url 
+            )
 
-        # --- 7. FINALIZE ---
-        koha.set_success(biblionumber, final_link, item_uuid=item_uuid)
-
-        return {"handle": final_link, "uuid": item_uuid}
+        return dspace_result
 
     except Exception as e:
-        logger.error(f"❌ Logic Error processing #{biblionumber}: {e}")
+        logger.error(f"❌ [Core] Logic Error processing #{biblionumber}: {e}")
         try: koha.set_status(biblionumber, 'error', str(e))
         except: pass
         
-        # 🔴 8. ERROR HANDLING (Move from Processed to Error)
-        # Якщо файл вже був переміщений у Processed (current_active_path), 
-        # але сталася помилка — переміщаємо його в Error.
         if current_active_path and os.path.exists(current_active_path):
             try:
-                source_dir = os.path.dirname(current_active_path) # Це папка Processed
-                # Error папка має бути на рівень вище (поруч з Processed, а не всередині)
+                source_dir = os.path.dirname(current_active_path) 
                 parent_dir = os.path.dirname(source_dir) 
                 error_dir = os.path.join(parent_dir, FOLDER_ERROR)
                 os.makedirs(error_dir, exist_ok=True)
-                
-                # Зберігаємо версійне ім'я, щоб знати, яка спроба провалилась
                 filename = os.path.basename(current_active_path)
-                error_dest = os.path.join(error_dir, filename)
-                
-                logger.info(f"⚠️ Moving failed file to Error folder: {error_dest}")
-                shutil.move(current_active_path, error_dest)
+                shutil.move(current_active_path, os.path.join(error_dir, filename))
             except Exception as move_err:
                 logger.error(f"Failed to move file to Error folder: {move_err}")
-
         raise e
 
-# --- ENDPOINTS ---
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -240,13 +239,11 @@ def check_security():
         abort(401, description="Invalid Token")
 
 @app.route('/kdv/api/health', methods=['GET'])
-def healthcheck(): return jsonify({"status": "ok", "mode": "v6.5-rename-first"})
+def healthcheck(): return jsonify({"status": "ok", "mode": "v6.5-parallel-covers"})
 
 @app.route('/kdv/api/integrate/<int:biblionumber>', methods=['POST'])
 def archive_record_async(biblionumber):
-    koha = KohaClient()
     try:
-        koha.set_status(biblionumber, 'processing', 'Queued...')
         task_id = task_manager.start_task(process_integration_logic, biblionumber)
         return jsonify({"status": "accepted", "task_id": task_id}), 202
     except Exception as e:

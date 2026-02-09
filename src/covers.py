@@ -63,7 +63,6 @@ class CoverService:
 
         # 3. Завантаження в Koha
         if self.koha:
-            # 🔴 ТУТ БУЛА ЗАГЛУШКА. ТЕПЕР РЕАЛЬНИЙ ВИКЛИК.
             upload_success = self._upload_to_koha(biblionumber, cover_path)
             
             if upload_success:
@@ -141,7 +140,6 @@ class CoverService:
         """
         try:
             logger.info(f"📡 [Cover] Uploading {file_path} to Koha #{biblionumber}...")
-            # Викликаємо метод з src/koha.py
             return self.koha.upload_cover(biblionumber, file_path)
         except Exception as e:
             logger.error(f"❌ [Cover] Upload failed: {e}")

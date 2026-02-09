@@ -29,6 +29,7 @@ def setup_logging():
 KDV_API_TOKEN = get_env("KDV_API_TOKEN")
 
 KOHA_API_URL = get_env("KOHA_API_URL").rstrip('/')
+KOHA_OPAC_URL = get_env("KOHA_OPAC_URL").rstrip('/')
 KOHA_USER = get_env("KOHA_API_USER")
 KOHA_PASS = get_env("KOHA_API_PASS")
 
@@ -42,7 +43,6 @@ DSPACE_PASS = get_env("DSPACE_API_PASS")
 DSPACE_SUBMISSION_SECTION = get_env("DSPACE_SUBMISSION_SECTION", required=False, default="traditionalpageone")
 
 INTEGRATOR_MOUNT_PATH = get_env("INTEGRATOR_MOUNT_PATH", default="/mnt/drive")
-FOLDER_INBOX = get_env("FOLDER_INBOX", default="Inbox")
 FOLDER_PROCESSED = get_env("FOLDER_PROCESSED", default="Processed")
 FOLDER_ERROR = get_env("FOLDER_ERROR", default="Error")
 
